@@ -9,7 +9,13 @@ using Terraria;
 using TerrariaApi.Reporting;
 using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
 using System.Collections.Immutable;
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace TerrariaApi.Server
 {
@@ -19,6 +25,7 @@ namespace TerrariaApi.Server
 	public static class ServerApi
 	{
 		public const string PluginsPath = "ServerPlugins";
+		private const string PluginScanCacheFileName = "pluginscan.cache.json";
 
 		/// <summary>
 		/// Returns the first value from <see cref="AdditionalPluginsPaths"/> if it exists, otherwise null.
@@ -30,7 +37,8 @@ namespace TerrariaApi.Server
 		public static ImmutableList<string> AdditionalPluginsPaths { get; private set; } = ImmutableList.Create<string>();
 		public static readonly Version ApiVersion = new Version(2, 1, 0, 0);
 		private static Main game;
-		private static readonly Dictionary<string, Assembly> loadedAssemblies = new Dictionary<string, Assembly>();
+		private static readonly ConcurrentDictionary<string, Lazy<Assembly>> loadedAssemblies =
+			new ConcurrentDictionary<string, Lazy<Assembly>>(StringComparer.OrdinalIgnoreCase);
 		private static readonly List<PluginContainer> plugins = new List<PluginContainer>();
 
 		internal static readonly CrashReporter reporter = new CrashReporter();
@@ -72,6 +80,12 @@ namespace TerrariaApi.Server
 		public static bool RunningMono { get; private set; }
 		public static bool ForceUpdate { get; private set; }
 		public static bool UseAsyncSocketsInMono { get; private set; }
+		public static bool LoadPluginSymbols { get; private set; }
+		internal static bool RuntimeProfileEnabled { get; private set; }
+		internal static int RuntimeProfileIntervalSeconds { get; private set; }
+		internal static int RuntimeProfileTop { get; private set; }
+		private static readonly ConcurrentDictionary<string, byte> unresolvedAssemblyCache =
+			new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
 
 		static ServerApi()
 		{
@@ -83,6 +97,10 @@ namespace TerrariaApi.Server
 
 			UseAsyncSocketsInMono = false;
 			ForceUpdate = false;
+			LoadPluginSymbols = false;
+			RuntimeProfileEnabled = false;
+			RuntimeProfileIntervalSeconds = 60;
+			RuntimeProfileTop = 10;
 			Type t = Type.GetType("Mono.Runtime");
 			RunningMono = (t != null);
 			Main.SkipAssemblyLoad = true;
@@ -125,10 +143,12 @@ namespace TerrariaApi.Server
 			AppDomain.CurrentDomain.AssemblyResolve += CurrentDomain_AssemblyResolve;
 
 			LoadPlugins();
+			RuntimeMetrics.Configure(RuntimeProfileEnabled, RuntimeProfileIntervalSeconds, RuntimeProfileTop);
 		}
 
 		internal static void DeInitialize()
 		{
+			RuntimeMetrics.Shutdown();
 			UnloadPlugins();
 			Profiler.Deatch();
 			LogWriter.Deatch();
@@ -284,6 +304,43 @@ namespace TerrariaApi.Server
 					case "-additionalplugins":
 						AdditionalPluginsPaths = arg.Value.Split(',').ToImmutableList();
 						break;
+					case "-loadsymbols":
+						LoadPluginSymbols = true;
+						LogWriter.ServerWriteLine(
+							"Plugin symbol loading enabled. Startup can be slower due to .pdb reads.",
+							TraceLevel.Warning);
+						break;
+					case "-runtimeprofile":
+						RuntimeProfileEnabled = true;
+						break;
+					case "-runtimeprofileinterval":
+						if (int.TryParse(arg.Value, out int runtimeProfileInterval))
+						{
+							RuntimeProfileIntervalSeconds = Math.Clamp(runtimeProfileInterval, 5, 3600);
+						}
+						else
+						{
+							LogWriter.ServerWriteLine(
+								"Invalid runtime profile interval, expected integer seconds. Using default 60.",
+								TraceLevel.Warning);
+							RuntimeProfileIntervalSeconds = 60;
+						}
+
+						break;
+					case "-runtimeprofiletop":
+						if (int.TryParse(arg.Value, out int runtimeProfileTop))
+						{
+							RuntimeProfileTop = Math.Clamp(runtimeProfileTop, 1, 30);
+						}
+						else
+						{
+							LogWriter.ServerWriteLine(
+								"Invalid runtime profile top value, expected integer. Using default 10.",
+								TraceLevel.Warning);
+							RuntimeProfileTop = 10;
+						}
+
+						break;
 				}
 			}
 		}
@@ -321,18 +378,24 @@ namespace TerrariaApi.Server
 
 			DangerousPluginDetector detector = new DangerousPluginDetector();
 
-			List<string> ignoredFiles = new List<string>();
+			HashSet<string> ignoredFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 			if (File.Exists(ignoredPluginsFilePath))
-				ignoredFiles.AddRange(File.ReadAllLines(ignoredPluginsFilePath));
-
-			List<FileInfo> fileInfos = new DirectoryInfo(ServerPluginsDirectoryPath).GetFiles("*.dll").ToList();
-			fileInfos.AddRange(new DirectoryInfo(ServerPluginsDirectoryPath).GetFiles("*.dll-plugin"));
-			foreach (string additionalPath in AdditionalPluginsPaths)
 			{
-				var di = new DirectoryInfo(Path.Combine(AppContext.BaseDirectory, additionalPath));
-				fileInfos.AddRange(di.GetFiles("*.dll"));
-				fileInfos.AddRange(di.GetFiles("*.dll-plugin"));
+				foreach (string raw in File.ReadLines(ignoredPluginsFilePath))
+				{
+					string fileName = raw.Trim();
+					if (fileName.Length == 0 || fileName.StartsWith("#"))
+						continue;
+
+					ignoredFiles.Add(fileName);
+				}
 			}
+
+			List<FileInfo> fileInfos = DeduplicatePluginFiles(EnumeratePluginFiles());
+			Dictionary<string, (byte[] pe, byte[] symbols, Exception error)> preloadedPluginBinaries =
+				PreloadPluginBinaries(fileInfos, ignoredFiles);
+			Dictionary<string, PluginScanCacheEntry> cachedPluginScanEntries = LoadPluginScanCacheEntries();
+			var updatedPluginScanEntries = new Dictionary<string, PluginScanCacheEntry>(StringComparer.OrdinalIgnoreCase);
 
 			Dictionary<TerrariaPlugin, Stopwatch> pluginInitWatches = new Dictionary<TerrariaPlugin, Stopwatch>();
 			foreach (FileInfo fileInfo in fileInfos)
@@ -349,44 +412,67 @@ namespace TerrariaApi.Server
 				try
 				{
 					Assembly assembly;
-					// The plugin assembly might have been resolved by another plugin assembly already, so no use to
-					// load it again, but we do still have to verify it and create plugin instances.
-					if (!loadedAssemblies.TryGetValue(fileNameWithoutExtension, out assembly))
+					byte[] pe = null;
+					try
 					{
-						byte[] pe = null;
-						try
+						if (preloadedPluginBinaries.TryGetValue(fileInfo.FullName, out var preloaded))
 						{
-							var pdb = Path.ChangeExtension(fileInfo.FullName, ".pdb");
-							var symbols = File.Exists(pdb) ? File.ReadAllBytes(pdb) : null;
-							assembly = Assembly.Load(pe = File.ReadAllBytes(fileInfo.FullName), symbols);
+							if (preloaded.error != null)
+								ExceptionDispatchInfo.Capture(preloaded.error).Throw();
+
+							pe = preloaded.pe;
+							assembly = GetOrLoadAssembly(
+								fileNameWithoutExtension,
+								() => Assembly.Load(preloaded.pe, preloaded.symbols));
 						}
-						catch (BadImageFormatException)
+						else
 						{
-							continue;
+							assembly = GetOrLoadAssembly(
+								fileNameWithoutExtension,
+								() => Assembly.Load(
+									pe = File.ReadAllBytes(fileInfo.FullName),
+									ReadPluginSymbols(fileInfo.FullName)));
 						}
-						catch(FileLoadException)
-						{
-							if (pe is not null)
-								TryCheckArchitecture(fileInfo, pe);
-							throw; // don't consume the exception, only care about testing arch here
-						}
-						loadedAssemblies.Add(fileNameWithoutExtension, assembly);
 					}
+					catch (BadImageFormatException)
+					{
+						continue;
+					}
+					catch (FileLoadException)
+					{
+						if (pe is null)
+							pe = File.ReadAllBytes(fileInfo.FullName);
+
+						TryCheckArchitecture(fileInfo, pe);
+						throw;
+					}
+
+					pe ??= File.ReadAllBytes(fileInfo.FullName);
 
 					if (!InvalidateAssembly(assembly, fileInfo.Name))
 						continue;
 
-					if (detector.MaliciousAssembly(assembly))
+					PluginScanCacheEntry scanEntry = GetCachedOrScannedPluginEntry(
+						assembly,
+						fileInfo,
+						pe,
+						cachedPluginScanEntries,
+						updatedPluginScanEntries,
+						out IReadOnlyList<Type> pluginTypes);
+
+					bool isDangerous = scanEntry.IsDangerous ?? detector.MaliciousAssembly(assembly);
+					scanEntry.IsDangerous = isDangerous;
+					updatedPluginScanEntries[fileInfo.FullName] = scanEntry;
+
+					if (isDangerous)
 					{
 						LogWriter.ServerWriteLine(string.Format("Assembly {0} {1} has been identified to the TShock Team as a dangerous plugin and needs to be removed.", assembly.GetName().Name, assembly.GetName().Version), TraceLevel.Error);
 						LogWriter.ServerWriteLine(string.Format("Continuing to use {0} may damage your server, your data, or your computer. For your safety, this plugin has been disabled.", assembly.GetName().Name), TraceLevel.Error);
 						continue;
 					}
 
-					foreach (Type type in assembly.GetExportedTypes())
+					foreach (Type type in pluginTypes)
 					{
-						if (!type.IsSubclassOf(typeof(TerrariaPlugin)) || !type.IsPublic || type.IsAbstract)
-							continue;
 						object[] customAttributes = type.GetCustomAttributes(typeof(ApiVersionAttribute), false);
 						if (customAttributes.Length == 0)
 							continue;
@@ -432,6 +518,9 @@ namespace TerrariaApi.Server
 						string.Format("Failed to load assembly \"{0}\".", fileInfo.Name), ex);
 				}
 			}
+
+			SavePluginScanCacheEntries(updatedPluginScanEntries);
+
 			IOrderedEnumerable<PluginContainer> orderedPluginSelector =
 				from x in Plugins
 				orderby x.Plugin.Order, x.Plugin.Name
@@ -518,34 +607,343 @@ namespace TerrariaApi.Server
 		private static Assembly CurrentDomain_AssemblyResolve(object sender, ResolveEventArgs args)
 		{
 			string fileName = args.Name.Split(',')[0];
+			if (unresolvedAssemblyCache.ContainsKey(fileName))
+				return null;
+
 			string path = Path.Combine(ServerPluginsDirectoryPath, fileName + ".dll");
 			try
 			{
-				if (File.Exists(path))
+				if (!File.Exists(path))
 				{
-					Assembly assembly;
-					if (!loadedAssemblies.TryGetValue(fileName, out assembly))
-					{
-						var pdbPath = Path.ChangeExtension(fileName, ".pdb");
-						assembly = Assembly.Load(File.ReadAllBytes(path), File.Exists(pdbPath) ? File.ReadAllBytes(pdbPath) : null);
-						// We just do this to return a proper error message incase this is a resolved plugin assembly
-						// referencing an old TerrariaServer version.
-						if (!InvalidateAssembly(assembly, fileName))
-							throw new InvalidOperationException(
-								"The assembly is referencing a version of TerrariaServer prior 1.14.");
-
-						loadedAssemblies.Add(fileName, assembly);
-					}
-					return assembly;
+					unresolvedAssemblyCache.TryAdd(fileName, 0);
+					return null;
 				}
+
+				Assembly assembly = GetOrLoadAssembly(
+					fileName,
+					() => Assembly.Load(File.ReadAllBytes(path), ReadPluginSymbols(path)));
+				// We just do this to return a proper error message incase this is a resolved plugin assembly
+				// referencing an old TerrariaServer version.
+				if (!InvalidateAssembly(assembly, fileName))
+					throw new InvalidOperationException(
+						"The assembly is referencing a version of TerrariaServer prior 1.14.");
+
+				unresolvedAssemblyCache.TryRemove(fileName, out _);
+				return assembly;
 			}
 			catch (Exception ex)
 			{
+				unresolvedAssemblyCache.TryAdd(fileName, 0);
 				LogWriter.ServerWriteLine(
 					string.Format("Error on resolving assembly \"{0}.dll\":\n{1}", fileName, ex),
 					TraceLevel.Error);
 			}
 			return null;
+		}
+
+		private static Assembly GetOrLoadAssembly(string assemblyName, Func<Assembly> factory)
+		{
+			Lazy<Assembly> lazyAssembly = loadedAssemblies.GetOrAdd(
+				assemblyName,
+				_ => new Lazy<Assembly>(factory, LazyThreadSafetyMode.ExecutionAndPublication));
+			try
+			{
+				return lazyAssembly.Value;
+			}
+			catch
+			{
+				loadedAssemblies.TryRemove(assemblyName, out _);
+				throw;
+			}
+		}
+
+		private static List<FileInfo> DeduplicatePluginFiles(IEnumerable<FileInfo> files)
+		{
+			var result = new List<FileInfo>();
+			var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+			foreach (FileInfo file in files)
+			{
+				if (!seenPaths.Add(file.FullName))
+				{
+					LogWriter.ServerWriteLine(
+						$"Duplicate plugin file skipped: \"{file.FullName}\".",
+						TraceLevel.Verbose);
+					continue;
+				}
+
+				result.Add(file);
+			}
+
+			return result;
+		}
+
+		private static PluginScanCacheEntry GetCachedOrScannedPluginEntry(
+			Assembly assembly,
+			FileInfo fileInfo,
+			byte[] pe,
+			IReadOnlyDictionary<string, PluginScanCacheEntry> cachedEntries,
+			IDictionary<string, PluginScanCacheEntry> updatedEntries,
+			out IReadOnlyList<Type> pluginTypes)
+		{
+			long fileSize = pe.LongLength;
+			long lastWriteUtcTicks = fileInfo.LastWriteTimeUtc.Ticks;
+			string hash = ComputeSha256(pe);
+
+			if (cachedEntries.TryGetValue(fileInfo.FullName, out PluginScanCacheEntry cachedEntry) &&
+				cachedEntry.Size == fileSize &&
+				cachedEntry.LastWriteUtcTicks == lastWriteUtcTicks &&
+				string.Equals(cachedEntry.Sha256, hash, StringComparison.OrdinalIgnoreCase))
+			{
+				List<Type> cachedTypes = ResolveCachedPluginTypes(assembly, cachedEntry.PluginTypeNames);
+				if (cachedTypes.Count == cachedEntry.PluginTypeNames.Count)
+				{
+					updatedEntries[fileInfo.FullName] = cachedEntry;
+					pluginTypes = cachedTypes;
+					return cachedEntry;
+				}
+			}
+
+			List<Type> scannedTypes = ScanPluginTypes(assembly);
+			PluginScanCacheEntry newEntry = new PluginScanCacheEntry
+			{
+				FullPath = fileInfo.FullName,
+				Size = fileSize,
+				LastWriteUtcTicks = lastWriteUtcTicks,
+				Sha256 = hash,
+				PluginTypeNames = scannedTypes
+					.Select(static type => type.FullName)
+					.Where(static typeName => !string.IsNullOrWhiteSpace(typeName))
+					.Cast<string>()
+					.ToList(),
+			};
+			updatedEntries[fileInfo.FullName] = newEntry;
+
+			pluginTypes = scannedTypes;
+			return newEntry;
+		}
+
+		private static List<Type> ResolveCachedPluginTypes(Assembly assembly, IReadOnlyCollection<string> typeNames)
+		{
+			var result = new List<Type>(typeNames.Count);
+			foreach (string typeName in typeNames)
+			{
+				if (string.IsNullOrWhiteSpace(typeName))
+					continue;
+
+				Type type = assembly.GetType(typeName, throwOnError: false, ignoreCase: false);
+				if (type is null || !type.IsPublic || type.IsAbstract || !type.IsSubclassOf(typeof(TerrariaPlugin)))
+					continue;
+
+				result.Add(type);
+			}
+
+			return result;
+		}
+
+		private static List<Type> ScanPluginTypes(Assembly assembly)
+		{
+			var result = new List<Type>();
+			foreach (Type type in assembly.GetExportedTypes())
+			{
+				if (!type.IsPublic || type.IsAbstract || !type.IsSubclassOf(typeof(TerrariaPlugin)))
+					continue;
+
+				result.Add(type);
+			}
+
+			return result;
+		}
+
+		private static string ComputeSha256(byte[] data)
+		{
+			return Convert.ToHexString(SHA256.HashData(data));
+		}
+
+		private static Dictionary<string, PluginScanCacheEntry> LoadPluginScanCacheEntries()
+		{
+			string cachePath = GetPluginScanCachePath();
+			if (!File.Exists(cachePath))
+				return new Dictionary<string, PluginScanCacheEntry>(StringComparer.OrdinalIgnoreCase);
+
+			try
+			{
+				PluginScanCacheModel model = JsonSerializer.Deserialize<PluginScanCacheModel>(File.ReadAllText(cachePath));
+				if (model is null || model.Version != 1 || model.Entries is null)
+					return new Dictionary<string, PluginScanCacheEntry>(StringComparer.OrdinalIgnoreCase);
+
+				var result = new Dictionary<string, PluginScanCacheEntry>(StringComparer.OrdinalIgnoreCase);
+				foreach (PluginScanCacheEntry entry in model.Entries)
+				{
+					if (string.IsNullOrWhiteSpace(entry.FullPath))
+						continue;
+
+					entry.PluginTypeNames ??= new List<string>();
+					result[entry.FullPath] = entry;
+				}
+
+				return result;
+			}
+			catch (Exception ex)
+			{
+				LogWriter.ServerWriteLine(
+					$"Failed to read plugin scan cache: {ex.Message}",
+					TraceLevel.Warning);
+				return new Dictionary<string, PluginScanCacheEntry>(StringComparer.OrdinalIgnoreCase);
+			}
+		}
+
+		private static void SavePluginScanCacheEntries(
+			IReadOnlyDictionary<string, PluginScanCacheEntry> entries)
+		{
+			string cachePath = GetPluginScanCachePath();
+			string temporaryPath = cachePath + ".tmp";
+			try
+			{
+				var model = new PluginScanCacheModel
+				{
+					Version = 1,
+					Entries = entries.Values
+						.OrderBy(static entry => entry.FullPath, StringComparer.OrdinalIgnoreCase)
+						.ToList(),
+				};
+
+				string payload = JsonSerializer.Serialize(model);
+				File.WriteAllText(temporaryPath, payload);
+				File.Move(temporaryPath, cachePath, overwrite: true);
+			}
+			catch (Exception ex)
+			{
+				LogWriter.ServerWriteLine(
+					$"Failed to write plugin scan cache: {ex.Message}",
+					TraceLevel.Warning);
+				if (File.Exists(temporaryPath))
+					File.Delete(temporaryPath);
+			}
+		}
+
+		private static string GetPluginScanCachePath()
+		{
+			return Path.Combine(ServerPluginsDirectoryPath, PluginScanCacheFileName);
+		}
+
+		private static IEnumerable<FileInfo> EnumeratePluginFiles()
+		{
+			var pluginsDirectory = new DirectoryInfo(ServerPluginsDirectoryPath);
+			foreach (FileInfo fileInfo in pluginsDirectory.EnumerateFiles("*.dll"))
+				yield return fileInfo;
+			foreach (FileInfo fileInfo in pluginsDirectory.EnumerateFiles("*.dll-plugin"))
+				yield return fileInfo;
+
+			foreach (string additionalPath in AdditionalPluginsPaths)
+			{
+				if (string.IsNullOrWhiteSpace(additionalPath))
+					continue;
+
+				string fullPath = Path.Combine(AppContext.BaseDirectory, additionalPath);
+				if (!Directory.Exists(fullPath))
+				{
+					LogWriter.ServerWriteLine(
+						$"Additional plugins path not found: \"{additionalPath}\".",
+						TraceLevel.Warning);
+					continue;
+				}
+
+				var additionalDirectory = new DirectoryInfo(fullPath);
+				foreach (FileInfo fileInfo in additionalDirectory.EnumerateFiles("*.dll"))
+					yield return fileInfo;
+				foreach (FileInfo fileInfo in additionalDirectory.EnumerateFiles("*.dll-plugin"))
+					yield return fileInfo;
+			}
+		}
+
+		private static byte[] ReadPluginSymbols(string assemblyPath)
+		{
+			if (!LoadPluginSymbols)
+				return null;
+
+			string pdbPath = Path.ChangeExtension(assemblyPath, ".pdb");
+			return File.Exists(pdbPath) ? File.ReadAllBytes(pdbPath) : null;
+		}
+
+		private static Dictionary<string, (byte[] pe, byte[] symbols, Exception error)> PreloadPluginBinaries(
+			IReadOnlyCollection<FileInfo> fileInfos,
+			IReadOnlySet<string> ignoredFiles)
+		{
+			return PreloadPluginBinariesAsync(fileInfos, ignoredFiles).GetAwaiter().GetResult();
+		}
+
+		private static async Task<Dictionary<string, (byte[] pe, byte[] symbols, Exception error)>> PreloadPluginBinariesAsync(
+			IReadOnlyCollection<FileInfo> fileInfos,
+			IReadOnlySet<string> ignoredFiles)
+		{
+			int maxConcurrency = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
+			using SemaphoreSlim limiter = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+
+			var preloaded = new ConcurrentDictionary<string, (byte[] pe, byte[] symbols, Exception error)>(
+				StringComparer.OrdinalIgnoreCase);
+			var tasks = new List<Task>(fileInfos.Count);
+
+			foreach (FileInfo fileInfo in fileInfos)
+			{
+				string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(fileInfo.Name);
+				if (ignoredFiles.Contains(fileNameWithoutExtension))
+					continue;
+
+				tasks.Add(PreloadPluginBinaryAsync(fileInfo, limiter, preloaded));
+			}
+
+			await Task.WhenAll(tasks).ConfigureAwait(false);
+			return new Dictionary<string, (byte[] pe, byte[] symbols, Exception error)>(
+				preloaded,
+				StringComparer.OrdinalIgnoreCase);
+		}
+
+		private static async Task PreloadPluginBinaryAsync(
+			FileInfo fileInfo,
+			SemaphoreSlim limiter,
+			ConcurrentDictionary<string, (byte[] pe, byte[] symbols, Exception error)> preloaded)
+		{
+			await limiter.WaitAsync().ConfigureAwait(false);
+			try
+			{
+				byte[] pe = await File.ReadAllBytesAsync(fileInfo.FullName).ConfigureAwait(false);
+				byte[] symbols = await ReadPluginSymbolsAsync(fileInfo.FullName).ConfigureAwait(false);
+				preloaded[fileInfo.FullName] = (pe, symbols, null);
+			}
+			catch (Exception ex)
+			{
+				preloaded[fileInfo.FullName] = (null, null, ex);
+			}
+			finally
+			{
+				limiter.Release();
+			}
+		}
+
+		private static async Task<byte[]> ReadPluginSymbolsAsync(string assemblyPath)
+		{
+			if (!LoadPluginSymbols)
+				return null;
+
+			string pdbPath = Path.ChangeExtension(assemblyPath, ".pdb");
+			return File.Exists(pdbPath) ? await File.ReadAllBytesAsync(pdbPath).ConfigureAwait(false) : null;
+		}
+
+		private sealed class PluginScanCacheModel
+		{
+			public int Version { get; set; }
+			public List<PluginScanCacheEntry> Entries { get; set; } = new List<PluginScanCacheEntry>();
+		}
+
+		private sealed class PluginScanCacheEntry
+		{
+			public string FullPath { get; set; } = string.Empty;
+			public long Size { get; set; }
+			public long LastWriteUtcTicks { get; set; }
+			public string Sha256 { get; set; } = string.Empty;
+			public List<string> PluginTypeNames { get; set; } = new List<string>();
+			public bool? IsDangerous { get; set; }
 		}
 
 		// Many types have changed with 1.14 and thus we won't even be able to check the ApiVersionAttribute of

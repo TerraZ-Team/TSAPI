@@ -22,6 +22,8 @@ namespace TerrariaApi.Server
 			this.hookName = hookName;
 		}
 
+		public int Count => this.registrations.Count;
+
 		public void Register(TerrariaPlugin registrator, HookHandler<ArgsType> handler, int priority)
 		{
 			if (registrator == null)
@@ -95,34 +97,24 @@ namespace TerrariaApi.Server
 		{
 			if (args == null)
 				throw new ArgumentNullException("args");
-			if (this.registrations.Count == 0)
+			List<HandlerRegistration<ArgsType>> registrations = this.registrations;
+			if (registrations.Count == 0)
 				return;
 
 			// We handle the registrations collection like an immuteable object, looping through it is always thread safe.
-			List<HandlerRegistration<ArgsType>> registrations =	this.registrations;
+			IProfiler profiler = ServerApi.Profiler.WrappedProfiler;
+			bool runtimeMetricsEnabled = RuntimeMetrics.Enabled;
 			foreach (var registration in registrations)
 			{
+				long startTimestamp = 0;
+				bool measureForProfiler = profiler != null;
+				bool measureForRuntimeMetrics = runtimeMetricsEnabled;
+				if (measureForProfiler || measureForRuntimeMetrics)
+					startTimestamp = Stopwatch.GetTimestamp();
+
 				try
 				{
-					if (ServerApi.Profiler.WrappedProfiler == null)
-					{
-						registration.Handler(args);
-					}
-					else
-					{
-						Stopwatch watch = new Stopwatch();
-
-						watch.Start();
-						try
-						{
-							registration.Handler(args);
-						}
-						finally
-						{
-							watch.Stop();
-							ServerApi.Profiler.InputPluginHandlerTime(registration.Registrator, hookName, watch.Elapsed);
-						}
-					}
+					registration.Handler(args);
 				}
 				catch (Exception ex)
 				{
@@ -131,6 +123,37 @@ namespace TerrariaApi.Server
 						registration.Registrator.Name, hookName, ex), TraceLevel.Warning);
 
 					ServerApi.Profiler.InputPluginHandlerExceptionThrown(registration.Registrator, hookName, ex);
+				}
+				finally
+				{
+					if (measureForProfiler || measureForRuntimeMetrics)
+					{
+						long elapsedTimestamp = Stopwatch.GetTimestamp() - startTimestamp;
+						try
+						{
+							if (measureForProfiler)
+							{
+								ServerApi.Profiler.InputPluginHandlerTime(
+									registration.Registrator,
+									hookName,
+									Stopwatch.GetElapsedTime(startTimestamp, startTimestamp + elapsedTimestamp));
+							}
+							if (measureForRuntimeMetrics)
+							{
+								RuntimeMetrics.RecordHookHandler(
+									registration.Registrator.Name,
+									hookName,
+									elapsedTimestamp);
+							}
+						}
+						catch (Exception metricsException)
+						{
+							ServerApi.LogWriter.ServerWriteLine(
+								string.Format("Runtime metrics recording failed for {0}/{1}: {2}",
+									registration.Registrator.Name, hookName, metricsException),
+								TraceLevel.Verbose);
+						}
+					}
 				}
 			}
 		}

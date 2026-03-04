@@ -20,6 +20,11 @@
 		<Description>This is the Terraria Server API, the API that TShock for Terraria runs on.</Description>
 	</PropertyGroup>
 
+	<PropertyGroup Condition="'$(Configuration)' == 'Release'">
+		<PublishReadyToRun Condition="'$(PublishReadyToRun)' == ''">true</PublishReadyToRun>
+		<ReadyToRunUseCrossgen2 Condition="'$(ReadyToRunUseCrossgen2)' == ''">true</ReadyToRunUseCrossgen2>
+	</PropertyGroup>
+
 	<ItemGroup>
 		<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
 		<PackageReference Include="System.Diagnostics.PerformanceCounter" Version="9.0.0" />
