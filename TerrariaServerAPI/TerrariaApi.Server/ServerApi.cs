@@ -37,8 +37,9 @@ namespace TerrariaApi.Server
 		public static ImmutableList<string> AdditionalPluginsPaths { get; private set; } = ImmutableList.Create<string>();
 		public static readonly Version ApiVersion = new Version(2, 1, 0, 0);
 		private static Main game;
-		private static readonly ConcurrentDictionary<string, Lazy<Assembly>> loadedAssemblies =
-			new ConcurrentDictionary<string, Lazy<Assembly>>(StringComparer.OrdinalIgnoreCase);
+		private static readonly Dictionary<string, Assembly> loadedAssemblies =
+			new Dictionary<string, Assembly>(StringComparer.OrdinalIgnoreCase);
+		private static readonly object loadedAssembliesLock = new object();
 		private static readonly List<PluginContainer> plugins = new List<PluginContainer>();
 
 		internal static readonly CrashReporter reporter = new CrashReporter();
@@ -84,9 +85,6 @@ namespace TerrariaApi.Server
 		internal static bool RuntimeProfileEnabled { get; private set; }
 		internal static int RuntimeProfileIntervalSeconds { get; private set; }
 		internal static int RuntimeProfileTop { get; private set; }
-		private static readonly ConcurrentDictionary<string, byte> unresolvedAssemblyCache =
-			new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
-
 		static ServerApi()
 		{
 			AppContext.SetSwitch("Switch.System.Diagnostics.StackTrace.ShowILOffsets", true);
@@ -607,17 +605,11 @@ namespace TerrariaApi.Server
 		private static Assembly CurrentDomain_AssemblyResolve(object sender, ResolveEventArgs args)
 		{
 			string fileName = args.Name.Split(',')[0];
-			if (unresolvedAssemblyCache.ContainsKey(fileName))
-				return null;
-
 			string path = Path.Combine(ServerPluginsDirectoryPath, fileName + ".dll");
 			try
 			{
 				if (!File.Exists(path))
-				{
-					unresolvedAssemblyCache.TryAdd(fileName, 0);
 					return null;
-				}
 
 				Assembly assembly = GetOrLoadAssembly(
 					fileName,
@@ -628,12 +620,10 @@ namespace TerrariaApi.Server
 					throw new InvalidOperationException(
 						"The assembly is referencing a version of TerrariaServer prior 1.14.");
 
-				unresolvedAssemblyCache.TryRemove(fileName, out _);
 				return assembly;
 			}
 			catch (Exception ex)
 			{
-				unresolvedAssemblyCache.TryAdd(fileName, 0);
 				LogWriter.ServerWriteLine(
 					string.Format("Error on resolving assembly \"{0}.dll\":\n{1}", fileName, ex),
 					TraceLevel.Error);
@@ -643,17 +633,14 @@ namespace TerrariaApi.Server
 
 		private static Assembly GetOrLoadAssembly(string assemblyName, Func<Assembly> factory)
 		{
-			Lazy<Assembly> lazyAssembly = loadedAssemblies.GetOrAdd(
-				assemblyName,
-				_ => new Lazy<Assembly>(factory, LazyThreadSafetyMode.ExecutionAndPublication));
-			try
+			lock (loadedAssembliesLock)
 			{
-				return lazyAssembly.Value;
-			}
-			catch
-			{
-				loadedAssemblies.TryRemove(assemblyName, out _);
-				throw;
+				if (loadedAssemblies.TryGetValue(assemblyName, out Assembly loaded))
+					return loaded;
+
+				Assembly assembly = factory();
+				loadedAssemblies[assemblyName] = assembly;
+				return assembly;
 			}
 		}
 
@@ -877,7 +864,7 @@ namespace TerrariaApi.Server
 			IReadOnlyCollection<FileInfo> fileInfos,
 			IReadOnlySet<string> ignoredFiles)
 		{
-			int maxConcurrency = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
+			const int maxConcurrency = 4;
 			using SemaphoreSlim limiter = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 
 			var preloaded = new ConcurrentDictionary<string, (byte[] pe, byte[] symbols, Exception error)>(
