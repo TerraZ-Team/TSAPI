@@ -52,6 +52,7 @@ namespace TerrariaApi.Server
 		private static int snapshotIntervalSeconds = 60;
 		private static int topEntries = 10;
 		private static volatile bool enabled;
+		private static int snapshotQueued;
 
 		public static bool Enabled => enabled;
 
@@ -71,7 +72,7 @@ namespace TerrariaApi.Server
 					return;
 
 				snapshotTimer = new Timer(
-					static _ => EmitSnapshotSafe(),
+					static _ => QueueSnapshot(),
 					null,
 					TimeSpan.FromSeconds(snapshotIntervalSeconds),
 					TimeSpan.FromSeconds(snapshotIntervalSeconds));
@@ -94,6 +95,7 @@ namespace TerrariaApi.Server
 				enabled = false;
 				snapshotTimer?.Dispose();
 				snapshotTimer = null;
+				Interlocked.Exchange(ref snapshotQueued, 0);
 				ClearCounters();
 			}
 		}
@@ -134,6 +136,64 @@ namespace TerrariaApi.Server
 				ServerApi.LogWriter.ServerWriteLine(
 					string.Format("Runtime profiling snapshot failed: {0}", ex),
 					TraceLevel.Warning);
+			}
+		}
+
+		internal static void RunMaintenance()
+		{
+			int removed = 0;
+			foreach (KeyValuePair<string, HookCounter> pair in hookCounters)
+			{
+				HookCounter counter = pair.Value;
+				if (Volatile.Read(ref counter.Count) != 0
+					|| Volatile.Read(ref counter.TotalTimestampTicks) != 0
+					|| Volatile.Read(ref counter.MaxTimestampTicks) != 0)
+				{
+					continue;
+				}
+
+				if (hookCounters.TryRemove(pair.Key, out _))
+					removed++;
+			}
+
+			if (removed > 0)
+			{
+				ServerApi.LogWriter.ServerWriteLine(
+					$"Runtime metrics maintenance removed {removed} inactive hook counters.",
+					TraceLevel.Verbose);
+			}
+		}
+
+		private static void QueueSnapshot()
+		{
+			if (!enabled)
+				return;
+
+			if (Interlocked.Exchange(ref snapshotQueued, 1) != 0)
+				return;
+
+			if (!BackgroundWork.TryQueue("runtime-metrics-snapshot", RunSnapshotFromBackground))
+			{
+				try
+				{
+					EmitSnapshotSafe();
+				}
+				finally
+				{
+					Interlocked.Exchange(ref snapshotQueued, 0);
+				}
+			}
+		}
+
+		private static void RunSnapshotFromBackground()
+		{
+			try
+			{
+				EmitSnapshotSafe();
+			}
+			finally
+			{
+				Interlocked.Exchange(ref snapshotQueued, 0);
 			}
 		}
 

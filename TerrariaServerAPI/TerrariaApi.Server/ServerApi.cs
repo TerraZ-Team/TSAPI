@@ -26,6 +26,7 @@ namespace TerrariaApi.Server
 	{
 		public const string PluginsPath = "ServerPlugins";
 		private const string PluginScanCacheFileName = "pluginscan.cache.json";
+		private const string RuntimeSettingsFileName = "tsapi.runtime.json";
 
 		/// <summary>
 		/// Returns the first value from <see cref="AdditionalPluginsPaths"/> if it exists, otherwise null.
@@ -41,6 +42,7 @@ namespace TerrariaApi.Server
 			new Dictionary<string, Assembly>(StringComparer.OrdinalIgnoreCase);
 		private static readonly object loadedAssembliesLock = new object();
 		private static readonly List<PluginContainer> plugins = new List<PluginContainer>();
+		private static RuntimeExecutionSettings runtimeSettings = new RuntimeExecutionSettings();
 
 		internal static readonly CrashReporter reporter = new CrashReporter();
 
@@ -85,6 +87,7 @@ namespace TerrariaApi.Server
 		internal static bool RuntimeProfileEnabled { get; private set; }
 		internal static int RuntimeProfileIntervalSeconds { get; private set; }
 		internal static int RuntimeProfileTop { get; private set; }
+		internal static RuntimeExecutionSettings RuntimeSettings => runtimeSettings;
 		static ServerApi()
 		{
 			AppContext.SetSwitch("Switch.System.Diagnostics.StackTrace.ShowILOffsets", true);
@@ -140,16 +143,37 @@ namespace TerrariaApi.Server
 			// TODO: Either adding the server plugins directory to PATH or as a privatePath node in the assembly config should do too.
 			AppDomain.CurrentDomain.AssemblyResolve += CurrentDomain_AssemblyResolve;
 
+			runtimeSettings = RuntimeExecutionSettings.LoadOrCreate(GetRuntimeSettingsPath());
+			BackgroundWork.Configure(runtimeSettings);
+
 			LoadPlugins();
 			RuntimeMetrics.Configure(RuntimeProfileEnabled, RuntimeProfileIntervalSeconds, RuntimeProfileTop);
+			RuntimeMaintenance.Configure(runtimeSettings);
 		}
 
 		internal static void DeInitialize()
 		{
+			RuntimeMaintenance.Shutdown();
 			RuntimeMetrics.Shutdown();
 			UnloadPlugins();
+			BackgroundWork.Shutdown();
 			Profiler.Deatch();
 			LogWriter.Deatch();
+		}
+
+		public static bool QueueBackgroundWork(string name, Action action)
+		{
+			return BackgroundWork.TryQueue(name, action);
+		}
+
+		public static bool QueueBackgroundWork(Action action)
+		{
+			return BackgroundWork.TryQueue("serverapi", action);
+		}
+
+		public static bool QueueMainThreadAction(Action action)
+		{
+			return BackgroundWork.TryQueueMainThread(action);
 		}
 
 		internal static void HandleCommandLine(string[] parms)
@@ -812,6 +836,11 @@ namespace TerrariaApi.Server
 		private static string GetPluginScanCachePath()
 		{
 			return Path.Combine(ServerPluginsDirectoryPath, PluginScanCacheFileName);
+		}
+
+		private static string GetRuntimeSettingsPath()
+		{
+			return Path.Combine(AppContext.BaseDirectory, RuntimeSettingsFileName);
 		}
 
 		private static IEnumerable<FileInfo> EnumeratePluginFiles()
