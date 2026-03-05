@@ -25,8 +25,10 @@ namespace TerrariaApi.Server
 		private const int MaxFileBatchSize = 256;
 		private const int MaxConsoleBatchSize = 256;
 		private const int MaxConsoleQueueSize = 4096;
+		private const int MaxFileQueueSize = 32768;
 		private static readonly TimeSpan FlushInterval = TimeSpan.FromMilliseconds(250);
 		private static readonly object consoleWriteLock = new object();
+		private readonly object fileWriteLock = new object();
 
 		protected StreamWriter LogFileWriter { get; private set; }
 		private readonly ConcurrentQueue<string> pendingFileLines = new ConcurrentQueue<string>();
@@ -36,6 +38,8 @@ namespace TerrariaApi.Server
 		private volatile bool disposeRequested;
 		private int disposed;
 		private int pendingConsoleCount;
+		private int pendingFileCount;
+		private int droppedFileLines;
 
 		public string Name
 		{
@@ -106,8 +110,9 @@ namespace TerrariaApi.Server
 				}
 			}
 
-			this.pendingFileLines.Enqueue(string.Format("[{0:MM/dd/yy HH:mm:ss}] [{1}] {2}: {3}", DateTime.Now, context, kind, message));
-			this.pendingSignal.Set();
+			EnqueueFileLine(
+				string.Format("[{0:MM/dd/yy HH:mm:ss}] [{1}] {2}: {3}", DateTime.Now, context, kind, message),
+				kind);
 		}
 
 		private void EnqueueConsoleLine(string context, string message, TraceLevel kind)
@@ -140,6 +145,29 @@ namespace TerrariaApi.Server
 			return new ConsoleLogEntry(string.Format("[{0}] {1} {2}", context, kind, message), color);
 		}
 
+		private void EnqueueFileLine(string line, TraceLevel kind)
+		{
+			int queueSize = Interlocked.Increment(ref this.pendingFileCount);
+			if (queueSize <= MaxFileQueueSize)
+			{
+				this.pendingFileLines.Enqueue(line);
+				this.pendingSignal.Set();
+				return;
+			}
+
+			Interlocked.Decrement(ref this.pendingFileCount);
+			Interlocked.Increment(ref this.droppedFileLines);
+
+			if (kind == TraceLevel.Error || kind == TraceLevel.Warning)
+			{
+				lock (this.fileWriteLock)
+				{
+					this.LogFileWriter.WriteLine(line);
+					this.LogFileWriter.Flush();
+				}
+			}
+		}
+
 		private static void WriteToConsole(ConsoleLogEntry entry)
 		{
 			lock (consoleWriteLock)
@@ -165,10 +193,14 @@ namespace TerrariaApi.Server
 				this.pendingSignal.WaitOne(50);
 
 				int fileWritten = 0;
-				while (fileWritten < MaxFileBatchSize && this.pendingFileLines.TryDequeue(out string line))
+				lock (this.fileWriteLock)
 				{
-					this.LogFileWriter.WriteLine(line);
-					fileWritten++;
+					while (fileWritten < MaxFileBatchSize && this.pendingFileLines.TryDequeue(out string line))
+					{
+						Interlocked.Decrement(ref this.pendingFileCount);
+						this.LogFileWriter.WriteLine(line);
+						fileWritten++;
+					}
 				}
 
 				int consoleWritten = 0;
@@ -185,14 +217,34 @@ namespace TerrariaApi.Server
 					bool flushByTime = Stopwatch.GetElapsedTime(lastFlushTimestamp, nowTimestamp) >= FlushInterval;
 					if (this.disposeRequested || fileWritten == MaxFileBatchSize || flushByTime || this.pendingFileLines.IsEmpty)
 					{
-						this.LogFileWriter.Flush();
+						lock (this.fileWriteLock)
+						{
+							this.LogFileWriter.Flush();
+						}
 						lastFlushTimestamp = nowTimestamp;
+					}
+				}
+
+				int droppedFileLines = Interlocked.Exchange(ref this.droppedFileLines, 0);
+				if (droppedFileLines > 0)
+				{
+					string droppedLine = string.Format(
+						"[{0:MM/dd/yy HH:mm:ss}] [Server API] Warning: File log queue overflow. Dropped lines: {1}",
+						DateTime.Now,
+						droppedFileLines);
+					lock (this.fileWriteLock)
+					{
+						this.LogFileWriter.WriteLine(droppedLine);
+						this.LogFileWriter.Flush();
 					}
 				}
 
 				if (this.disposeRequested && this.pendingFileLines.IsEmpty && Volatile.Read(ref this.pendingConsoleCount) == 0)
 				{
-					this.LogFileWriter.Flush();
+					lock (this.fileWriteLock)
+					{
+						this.LogFileWriter.Flush();
+					}
 					return;
 				}
 			}
@@ -206,12 +258,16 @@ namespace TerrariaApi.Server
 				WriteToConsole(entry);
 			}
 
-			while (this.pendingFileLines.TryDequeue(out string line))
+			lock (this.fileWriteLock)
 			{
-				this.LogFileWriter.WriteLine(line);
-			}
+				while (this.pendingFileLines.TryDequeue(out string line))
+				{
+					Interlocked.Decrement(ref this.pendingFileCount);
+					this.LogFileWriter.WriteLine(line);
+				}
 
-			this.LogFileWriter.Flush();
+				this.LogFileWriter.Flush();
+			}
 		}
 
 		~ServerLogWriter()

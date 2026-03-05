@@ -28,9 +28,11 @@ internal static class GameHooks
 	{
 		if (!args.ContinueExecution) return;
 		args.ContinueExecution = false;
+		BackgroundWork.DrainMainThreadQueue();
 		_hookManager.InvokeGameUpdate();
 		args.OriginalMethod(args.gameTime);
 		_hookManager.InvokeGamePostUpdate();
+		BackgroundWork.DrainMainThreadQueue();
 	}
 
 	private static void OnHardmodeTileUpdate(object sender, Hooks.WorldGen.HardmodeTileUpdateEventArgs e)
