@@ -13,7 +13,7 @@
 		<Product>TSAPI</Product>
 		<Company>TShock Contributors</Company>
 		<!-- extras for nuget -->
-		<PackageId>TSAPI</PackageId>
+		<PackageId>TZ.TSAPI</PackageId>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
 		<Authors>TShock Contributors</Authors>

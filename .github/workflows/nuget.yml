@@ -1,28 +1,37 @@
-name: Deploy NuGet(OTAPI3)
+name: Publish TZ.TSAPI
 
 on:
   push:
     branches: [ nuget-release ]
+  workflow_dispatch:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     environment: release
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: 9.0.x
-    - name: Restore dependencies
-      run: dotnet restore
-    - name: Build
-      run: dotnet build TSAPI.sln --configuration Release --no-restore
-    - name: Test
-      run: dotnet test --no-build --verbosity normal --configuration Release --filter "FullyQualifiedName!~TerrariaServerAPI.Tests.Benchmarks"
+      - uses: actions/checkout@v4
 
-    # Publish
-    - name: Push TSAPI
-      run: dotnet nuget push TerrariaServerAPI/bin/Release/*.nupkg -k ${{ secrets.NUGET_API_KEY }} -s https://api.nuget.org/v3/index.json
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: MonoMod dev build
+        run: dotnet nuget add source https://pkgs.dev.azure.com/MonoMod/MonoMod/_packaging/DevBuilds%40Local/nuget/v3/index.json -n DevBuilds@Local
+
+      - name: Restore dependencies
+        run: dotnet restore TSAPI.sln
+
+      - name: Build
+        run: dotnet build TSAPI.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test TSAPI.sln --no-build --verbosity normal --configuration Release --filter "FullyQualifiedName!~TerrariaServerAPI.Tests.Benchmarks"
+
+      - name: Pack TZ.TSAPI
+        run: dotnet pack TerrariaServerAPI/TerrariaServerAPI.csproj --configuration Release --no-build
+
+      - name: Push TZ.TSAPI
+        run: dotnet nuget push "TerrariaServerAPI/bin/Release/TZ.TSAPI.*.nupkg" --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate

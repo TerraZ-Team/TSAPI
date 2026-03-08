@@ -1,4 +1,4 @@
-name: CI OTAPI3
+name: CI
 
 # Controls when the workflow will run
 on: 
@@ -47,8 +47,11 @@ jobs:
       - name: MonoMod dev build
         run: dotnet nuget add source https://pkgs.dev.azure.com/MonoMod/MonoMod/_packaging/DevBuilds%40Local/nuget/v3/index.json -n DevBuilds@Local
 
+      - name: Restore dependencies
+        run: dotnet restore TSAPI.sln
+
       - name: Build the solution
-        run: dotnet build TSAPI.sln -c Release
+        run: dotnet build TSAPI.sln -c Release --no-restore
 
       - name: Run tests
-        run: dotnet test --filter "FullyQualifiedName!~TerrariaServerAPI.Tests.Benchmarks"
+        run: dotnet test TSAPI.sln -c Release --no-build --filter "FullyQualifiedName!~TerrariaServerAPI.Tests.Benchmarks"
