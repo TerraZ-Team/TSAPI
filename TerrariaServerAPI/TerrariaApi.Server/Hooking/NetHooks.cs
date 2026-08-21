@@ -11,8 +11,6 @@ internal class NetHooks
 	private static HookManager _hookManager;
 	private static readonly BitArray knownPacketIds = BuildKnownPacketIds();
 
-	public static readonly object syncRoot = new();
-
 	/// <summary>
 	/// Attaches any of the OTAPI Net hooks to the existing <see cref="HookManager"/> implementation
 	/// </summary>
@@ -22,7 +20,6 @@ internal class NetHooks
 		_hookManager = hookManager;
 
 		HookEvents.Terraria.NetMessage.greetPlayer += OnGreetPlayer;
-		HookEvents.Terraria.Netplay.OnConnectionAccepted += OnConnectionAccepted;
 		HookEvents.Terraria.Chat.ChatHelper.BroadcastChatMessage += OnBroadcastChatMessage;
 		HookEvents.Terraria.Net.NetManager.SendData += OnSendNetData;
 		HookEvents.Terraria.Netplay.UpdateConnectedClients += OnUpdateConnectedClients;
@@ -40,7 +37,7 @@ internal class NetHooks
 		args.OriginalMethod();
 		if (ServerApi.ForceUpdate)
 		{
-			Terraria.Netplay.HasClients = true;
+			Terraria.Netplay.HasFullyConnectedClients = true;
 		}
 	}
 
@@ -180,37 +177,6 @@ internal class NetHooks
 		{
 			e.Result = HookResult.Cancel;
 		}
-	}
-
-	static void OnConnectionAccepted(object? sender, HookEvents.Terraria.Netplay.OnConnectionAcceptedEventArgs args)
-	{
-		if (!args.ContinueExecution) return;
-		args.ContinueExecution = false;
-		int slot = FindNextOpenClientSlot();
-		if (slot != -1)
-		{
-			Netplay.Clients[slot].Reset();
-			Netplay.Clients[slot].Socket = args.client;
-		}
-		if (FindNextOpenClientSlot() == -1)
-		{
-			Netplay.StopListening();
-		}
-	}
-
-	static int FindNextOpenClientSlot()
-	{
-		lock (syncRoot)
-		{
-			for (int i = 0; i < Main.maxNetPlayers; i++)
-			{
-				if (!Netplay.Clients[i].IsConnected())
-				{
-					return i;
-				}
-			}
-		}
-		return -1;
 	}
 
 	private static BitArray BuildKnownPacketIds()
