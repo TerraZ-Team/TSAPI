@@ -9,6 +9,7 @@ using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text;
 using System.Threading.Tasks;
 using Terraria;
@@ -157,6 +158,7 @@ namespace TerrariaApi.Reporting
 			};
 		}
 
+		[SupportedOSPlatform("windows")]
 		internal dynamic GetProcessMemoryInfo(string processName)
 		{
 			var memory = new PerformanceCounterCategory(".NET CLR Memory", ".").GetCounters(processName);
@@ -169,6 +171,15 @@ namespace TerrariaApi.Reporting
 		}
 
 		internal dynamic GetMemoryInfo()
+		{
+			if (!OperatingSystem.IsWindows())
+				return GetMemoryInfoMono();
+
+			return GetMemoryInfoWindows();
+		}
+
+		[SupportedOSPlatform("windows")]
+		private dynamic GetMemoryInfoWindows()
 		{
 			return from i in new PerformanceCounterCategory(".NET CLR Memory").GetInstanceNames().Where(i => i.Contains("TerrariaServer"))
 				   select new
