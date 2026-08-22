@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - agent/tsapi-warning-cleanup
+  pull_request:
+    branches:
+      - general-devel
 
 jobs:
   export:
