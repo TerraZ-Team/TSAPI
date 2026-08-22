@@ -159,6 +159,9 @@ namespace TerrariaApi.Reporting
 
 		internal dynamic GetProcessMemoryInfo(string processName)
 		{
+			if (!OperatingSystem.IsWindows())
+				return GetMemoryInfoMono();
+
 			var memory = new PerformanceCounterCategory(".NET CLR Memory", ".").GetCounters(processName);
 
 			return new
@@ -170,6 +173,9 @@ namespace TerrariaApi.Reporting
 
 		internal dynamic GetMemoryInfo()
 		{
+			if (!OperatingSystem.IsWindows())
+				return GetMemoryInfoMono();
+
 			return from i in new PerformanceCounterCategory(".NET CLR Memory").GetInstanceNames().Where(i => i.Contains("TerrariaServer"))
 				   select new
 				   {
