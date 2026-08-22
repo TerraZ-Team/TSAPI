@@ -98,8 +98,10 @@ internal static class NpcHooks
 			var Stack = e.Stack;
 			var noBroadcast = e.NoBroadcast;
 			var pfix = e.Pfix;
-			var noGrabDelay = e.NoGrabDelay;
-			var reverseLookup = e.ReverseLookup;
+			// Terraria 1.4.5 removed these values from item spawning. Keep local compatibility
+			// arguments for legacy TSAPI hook consumers, but do not read the obsolete OTAPI fields.
+			var noGrabDelay = false;
+			var reverseLookup = false;
 
 			var position = new Vector2(e.X, e.Y);
 			if (_hookManager.InvokeNpcLootDrop
@@ -130,8 +132,6 @@ internal static class NpcHooks
 			e.Stack = Stack;
 			e.NoBroadcast = noBroadcast;
 			e.Pfix = pfix;
-			e.NoGrabDelay = noGrabDelay;
-			e.ReverseLookup = reverseLookup;
 		}
 	}
 
@@ -147,8 +147,10 @@ internal static class NpcHooks
 		var Stack = e.Stack;
 		var noBroadcast = e.NoBroadcast;
 		var pfix = e.Pfix;
-		var noGrabDelay = e.NoGrabDelay;
-		var reverseLookup = e.ReverseLookup;
+		// Terraria 1.4.5 removed these values from item spawning. Keep local compatibility
+		// arguments for legacy TSAPI hook consumers, but do not read the obsolete OTAPI fields.
+		var noGrabDelay = false;
+		var reverseLookup = false;
 
 		var positon = new Vector2(e.X, e.Y);
 		if (_hookManager.InvokeDropBossBag
@@ -175,8 +177,6 @@ internal static class NpcHooks
 		e.Stack = Stack;
 		e.NoBroadcast = noBroadcast;
 		e.Pfix = pfix;
-		e.NoGrabDelay = noGrabDelay;
-		e.ReverseLookup = reverseLookup;
 	}
 
 	static void OnAI(NPC npc, HookEvents.Terraria.NPC.AIEventArgs args)
