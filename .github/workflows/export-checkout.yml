@@ -1,0 +1,23 @@
+name: Export checkout
+
+on:
+  push:
+    branches:
+      - agent/tsapi-warning-cleanup
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pack checkout
+        run: tar --exclude=.git -czf "$RUNNER_TEMP/tsapi-checkout.tar.gz" .
+
+      - name: Upload checkout
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsapi-checkout
+          path: ${{ runner.temp }}/tsapi-checkout.tar.gz
+          if-no-files-found: error
+          retention-days: 1
