@@ -1,0 +1,37 @@
+name: Diagnose build warnings
+
+on:
+  push:
+    branches:
+      - agent/tsapi-warning-cleanup
+  pull_request:
+    branches:
+      - general-devel
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: MonoMod dev build
+        run: dotnet nuget add source https://pkgs.dev.azure.com/MonoMod/MonoMod/_packaging/DevBuilds%40Local/nuget/v3/index.json -n DevBuilds@Local
+
+      - name: Restore
+        run: dotnet restore TSAPI.sln
+
+      - name: Build and capture warnings
+        run: dotnet build TSAPI.sln -c Release --no-restore --nologo --verbosity minimal 2>&1 | tee build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: warning-build-log
+          path: build.log
+          if-no-files-found: error
+          retention-days: 1
