@@ -159,5 +159,7 @@ public enum PacketTypes
 	RequestSection = 159,
 	SyncItemPosition = 160,
 	HostToken = 161,
-	DamageNPCAck = 162
+	DamageNPCAck = 162,
+	ServerInfo = 163,
+	PlayerPlatformInfo = 164
 }
