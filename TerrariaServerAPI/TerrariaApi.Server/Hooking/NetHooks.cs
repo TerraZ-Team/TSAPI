@@ -190,6 +190,7 @@ internal class NetHooks
 				maxPacketId = packetId;
 		}
 
+
 		var map = new BitArray(maxPacketId + 1);
 		for (int i = 0; i < values.Length; i++)
 		{
